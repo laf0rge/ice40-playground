@@ -28,7 +28,7 @@
 #include <stdio.h>
 #include <errno.h>
 
-#include "hexdump.h"
+#include <osmocom/core/utils.h>
 
 
 static uint8_t g_usb_endpoint = 0x81;
