@@ -1,6 +1,6 @@
 CC=gcc
-CFLAGS=`pkg-config libusb-1.0 libosmocore --cflags` -O2 -Wall
-LDLIBS=`pkg-config libusb-1.0 libosmocore --libs`
+CFLAGS=`pkg-config libusb-1.0 libosmocore libosmoabis --cflags` -O2 -Wall
+LDLIBS=`pkg-config libusb-1.0 libosmocore libosmoabis --libs`
 
 OBJS=main dump
 
