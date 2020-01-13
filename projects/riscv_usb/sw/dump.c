@@ -44,6 +44,20 @@ struct e1_chunk_hdr {
 	uint8_t ep;		/* USB endpoint */
 } __attribute__((packed));
 
+
+static void handle_frame(const struct e1_chunk_hdr *hdr, const uint8_t *data)
+{
+	/* filter on the endpoint (direction) specified by the user */
+	if (hdr->ep != g_usb_endpoint)
+		return;
+
+	if (hdr->len <= 4)
+		return;
+
+	for (int i = 4; i < hdr->len-4; i += 32)
+		printf("%s\n", osmo_hexdump(data+i, 32));
+}
+
 static int process_file(int fd)
 {
 	struct e1_chunk_hdr hdr;
@@ -76,16 +90,7 @@ static int process_file(int fd)
 			fprintf(stderr, "%d is less than payload size (%d)\n", rc, hdr.len);
 			return -1;
 		}
-
-		/* filter on the endpoint (direction) specified by the user */
-		if (hdr.ep != g_usb_endpoint)
-			continue;
-
-		if (hdr.len <= 4)
-			continue;
-
-		for (int i = 4; i < hdr.len-4; i += 32)
-			printf("%s\n", osmo_hexdump(buf+i, 32));
+		handle_frame(&hdr, buf);
 	}
 }
 
