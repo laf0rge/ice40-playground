@@ -45,7 +45,19 @@ struct e1_chunk_hdr {
 	uint8_t ep;		/* USB endpoint */
 } __attribute__((packed));
 
-static struct osmo_isdnhdlc_vars g_hdlc[2]; /* one per direction */
+
+/* local state per E1 line */
+struct line_state {
+	struct osmo_isdnhdlc_vars hdlc;
+	struct {
+		FILE *outfile;
+		uint64_t last_sec;
+		uint64_t frame_err_cnt;
+		uint64_t crc_err_cnt;
+	} errplot;
+};
+
+static struct line_state g_line[2]; /* one per direction */
 static int g_pcap_fd = -1;
 static struct msgb *g_pcap_msg;
 
@@ -76,20 +88,39 @@ static void handle_payload(uint8_t ep, const uint8_t *data, int len)
 }
 
 
+static void handle_frame_errplot(struct line_state *ls, const struct e1_chunk_hdr *hdr, const uint8_t *data)
+{
+	if (!ls->errplot.outfile)
+		return;
+
+	if (!ls->errplot.last_sec)
+		ls->errplot.last_sec = hdr->time.sec;
+
+	if (ls->errplot.last_sec != hdr->time.sec) {
+		/* dump the per-second total; start from 0 again */
+		fprintf(ls->errplot.outfile, "%"PRIu64 " %"PRIu64 " %"PRIu64"\n",
+			hdr->time.sec, ls->errplot.frame_err_cnt, ls->errplot.crc_err_cnt);
+		ls->errplot.frame_err_cnt = 0;
+		ls->errplot.crc_err_cnt = 0;
+		ls->errplot.last_sec = hdr->time.sec;
+		fflush(ls->errplot.outfile);
+	}
+}
+
 /* called for each USB transfer read from the file */
 static void handle_frame(const struct e1_chunk_hdr *hdr, const uint8_t *data)
 {
 	uint8_t nots0[1024];
 	unsigned int offs = 0;
-	struct osmo_isdnhdlc_vars *hdlc;
+	struct line_state *ls;
 
 	/* filter on the endpoint (direction) specified by the user */
 	switch (hdr->ep) {
 	case 0x81:
-		hdlc = &g_hdlc[0];
+		ls = &g_line[0];
 		break;
 	case 0x82:
-		hdlc = &g_hdlc[1];
+		ls = &g_line[1];
 		break;
 	default:
 		fprintf(stderr, "Unexpected USB EP 0x%02x\n", hdr->ep);
@@ -99,13 +130,17 @@ static void handle_frame(const struct e1_chunk_hdr *hdr, const uint8_t *data)
 	if (hdr->len <= 4)
 		return;
 
+	//printf("%"PRIu64".%"PRIu64" EP=0x%02x\n", hdr->time.sec, hdr->time.usec, hdr->ep);
+
+	OSMO_ASSERT(((hdr->len-4)/32)*31 < ARRAY_SIZE(nots0));
+	/* gather the TS1..TS31 data, skipping TS0 */
 	for (int i = 4; i < hdr->len-4; i += 32) {
 		//printf("\t%s\n", osmo_hexdump(data+i, 32));
 		memcpy(nots0+offs, data+i+1, 32-1);
 		offs += 31;
 	}
 
-	//printf("IN: %s\n", osmo_hexdump(nots0, offs));
+	//printf("IN(%u): %s\n", offs, osmo_hexdump(nots0, offs));
 	uint8_t out[512];
 	int rc;
 	int rl;
@@ -113,13 +148,19 @@ static void handle_frame(const struct e1_chunk_hdr *hdr, const uint8_t *data)
 	int oi = 0;
 
 	while (oi < offs) {
-		rc = osmo_isdnhdlc_decode(hdlc, nots0+oi, offs-oi, &rl, out, sizeof(out));
-		if (rc < 0)
-			fprintf(stderr, "ERR in HDLC decode: %d\n", rc);
-		else if (rc > 0)
+		rc = osmo_isdnhdlc_decode(&ls->hdlc, nots0+oi, offs-oi, &rl, out, sizeof(out));
+		//printf("osmo_isdnhdlc_decode(hdlc, nots0+%d, inlen=%d, &rl=%d, out, %zu)=%d\n", oi, offs-oi, rl, sizeof(out), rc);
+		if (rc < 0) {
+			fprintf(stdout, "ERR in HDLC decode: %d\n", rc);
+			if (rc == -1)
+				ls->errplot.frame_err_cnt++;
+			else if (rc == -2)
+				ls->errplot.crc_err_cnt++;
+		} else if (rc > 0)
 			handle_payload(hdr->ep, out, rc);
 		oi += rl;
 	}
+	handle_frame_errplot(ls, hdr, data);
 }
 
 static int process_file(int fd)
@@ -193,16 +234,24 @@ int main(int argc, char **argv)
 	}
 
 	if (argc >= 3) {
+#if 0
 		g_pcap_fd = osmo_pcap_lapd_open(argv[2], 0640);
 		if (g_pcap_fd < 0) {
 			fprintf(stderr, "Unable to open PCAP output: %s\n", strerror(errno));
 			exit(1);
 		}
 		g_pcap_msg = msgb_alloc(4096, "pcap");
+#endif
 	}
 
-	for (i = 0; i < ARRAY_SIZE(g_hdlc); i++)
-		osmo_isdnhdlc_rcv_init(&g_hdlc[i], OSMO_HDLC_F_BITREVERSE);
+	for (i = 0; i < ARRAY_SIZE(g_line); i++) {
+		struct line_state *ls = &g_line[i];
+		char namebuf[32];
+		osmo_isdnhdlc_rcv_init(&ls->hdlc, OSMO_HDLC_F_BITREVERSE);
+
+		snprintf(namebuf, sizeof(namebuf), "errplot-%d.dat", i);
+		//ls->errplot.outfile = fopen(namebuf, "w");
+	}
 
 	process_file(rc);
 }
