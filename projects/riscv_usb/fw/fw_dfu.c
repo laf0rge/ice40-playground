@@ -90,7 +90,7 @@ void main()
 	led_state(true);
 
 	/* SPI */
-	spi_init();
+	spi_init(0);
 
 	/* Enable USB directly */
 	serial_no_init();

@@ -40,7 +40,7 @@ _dfu_vendor_spi_exec_cb(struct usb_xfer *xfer)
 	struct spi_xfer_chunk sx[1] = {
 		{ .data = xfer->data, .len = xfer->len, .read = true, .write = true, },
 	};
-	spi_xfer(SPI_CS_FLASH, sx, 1);
+	spi_xfer(0, SPI_CS_FLASH, sx, 1);
 	return true;
 }
 
