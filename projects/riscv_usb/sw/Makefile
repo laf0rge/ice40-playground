@@ -2,7 +2,7 @@ CC=gcc
 CFLAGS=`pkg-config libusb-1.0 libosmocore libosmoabis --cflags` -O2 -Wall
 LDLIBS=`pkg-config libusb-1.0 libosmocore --libs`
 
-OBJS=main dump
+OBJS=main dump replay hdlc-decode-pipe
 
 all: $(OBJS)
 
