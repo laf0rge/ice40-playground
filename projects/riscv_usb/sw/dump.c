@@ -35,6 +35,7 @@
 #include <osmocom/core/isdnhdlc.h>
 #include <osmocom/core/gsmtap.h>
 #include <osmocom/core/gsmtap_util.h>
+#include <osmocom/core/linuxlist.h>
 //#include <osmocom/abis/lapd_pcap.h>
 
 #include "osmo_e1f.h"
@@ -71,8 +72,41 @@ static int g_pcap_fd = -1;
 static struct msgb *g_pcap_msg;
 struct gsmtap_inst *g_gsmtap;
 
+struct pl_item
+{
+	struct llist_head list;
+	struct timeval tstamp;
+	struct msgb *msg;
+};
+
+LLIST_HEAD(pl_queue);
+
+struct msgb *queue_get_oldest(struct llist_head *queue_head)
+{
+	struct pl_item *item;
+	struct pl_item *min_item = NULL;
+	struct msgb *msg;
+
+	if (llist_empty(queue_head))
+		return NULL;
+
+	llist_for_each_entry(item, queue_head, list) {
+		if (!min_item) {
+			min_item = item;
+			continue;
+		}
+		if (timercmp(&item->tstamp, &min_item->tstamp, <))
+			min_item = item;
+	}
+
+	msg = min_item->msg;
+	llist_del(&min_item->list);
+	talloc_free(min_item);
+	return msg;
+}
+
 /* called for each HDLC payload frame */
-static void handle_payload(uint8_t idx, const uint8_t *data, int len)
+static void handle_payload(uint8_t idx, const uint8_t *data, int len, struct timeval *tstamp)
 {
 #if 0
 	int dir;
@@ -96,18 +130,37 @@ static void handle_payload(uint8_t idx, const uint8_t *data, int len)
 		msgb_reset(g_pcap_msg);
 	} else
 #endif
-		printf("%u: OUT: %s\n", idx, osmo_hexdump(data, len));
+	printf("%li.%06li ", tstamp->tv_sec, tstamp->tv_usec);
+	printf("%u: OUT: %s\n", idx, osmo_hexdump(data, len));
 
 	if (g_gsmtap) {
+		struct pl_item *item = talloc_zero(NULL, struct pl_item);
 		struct msgb *msg;
 		msg = gsmtap_makemsg_ex(GSMTAP_TYPE_E1T1, idx ? GSMTAP_ARFCN_F_UPLINK : 0, 255,
 					GSMTAP_E1T1_FR, 0, 0, 0, 0, data, len);
 		OSMO_ASSERT(msg);
-		gsmtap_sendmsg(g_gsmtap, msg);
+		item->tstamp = *tstamp;
+		item->msg = msg;
+		llist_add_tail(&item->list, &pl_queue);
+
+		if (llist_count(&pl_queue) > 8) {
+			msg = queue_get_oldest(&pl_queue);
+			if (msg)
+				gsmtap_sendmsg(g_gsmtap, msg);
+		}
 	}
 }
 
+void drain_queue(struct llist_head *queue_head)
+{
+	struct msgb* msg;
 
+	if (g_gsmtap) {
+		while ((msg = queue_get_oldest(&pl_queue))) {
+			gsmtap_sendmsg(g_gsmtap, msg);
+		}
+	}
+}
 
 static void handle_frame_errplot(struct line_state *ls, const struct e1_chunk_hdr *hdr, const uint8_t *data)
 {
@@ -132,7 +185,7 @@ static void handle_frame_errplot(struct line_state *ls, const struct e1_chunk_hd
 }
 
 /* called for each USB transfer read from the file */
-static void handle_frame(const struct e1_chunk_hdr *hdr, const uint8_t *data)
+static void handle_frame(const struct e1_chunk_hdr *hdr, const uint8_t *data, int ep_adj)
 {
 	uint8_t nots0[1024];
 	unsigned int offs = 0;
@@ -181,14 +234,23 @@ static void handle_frame(const struct e1_chunk_hdr *hdr, const uint8_t *data)
 				ls->errplot.frame_err_cnt++;
 			else if (rc == -2)
 				ls->errplot.crc_err_cnt++;
-		} else if (rc > 0)
-			handle_payload(ls->idx, out, rc);
+		} else if (rc > 0) {
+			struct timeval tstamp = {
+				.tv_sec = hdr->time.sec,
+				.tv_usec = hdr->time.usec
+			};
+
+			tstamp.tv_usec += ((oi + rl) * 125) / 31;
+			if (hdr->ep == ep_adj)
+				tstamp.tv_usec += 1000;
+			handle_payload(ls->idx, out, rc, &tstamp);
+		}
 		oi += rl;
 	}
 	handle_frame_errplot(ls, hdr, data);
 }
 
-static int process_file(int fd)
+static int process_file(int fd, int ep_adj)
 {
 	struct e1_chunk_hdr hdr;
 	unsigned long offset = 0;
@@ -203,12 +265,14 @@ static int process_file(int fd)
 			return rc;
 		if (rc != sizeof(hdr)) {
 			fprintf(stderr, "%d is less than header size (%zd)\n", rc, sizeof(hdr));
-			return -1;
+			rc = -1;
+			goto out;
 		}
 		offset += rc;
 		if (hdr.magic != E1_CHUNK_HDR_MAGIC) {
 			fprintf(stderr, "offset %lu: Wrong magic 0x%08x\n", offset, hdr.magic);
-			return -1;
+			rc = -1;
+			goto out;
 		}
 
 		/* then read payload */
@@ -218,10 +282,14 @@ static int process_file(int fd)
 		offset += rc;
 		if (rc != hdr.len) {
 			fprintf(stderr, "%d is less than payload size (%d)\n", rc, hdr.len);
-			return -1;
+			rc = -1;
+			goto out;
 		}
-		handle_frame(&hdr, buf);
+		handle_frame(&hdr, buf, ep_adj);
 	}
+out:
+	drain_queue(&pl_queue);
+	return rc;
 }
 
 static int open_file(const char *fname)
@@ -257,23 +325,69 @@ static const struct log_info log_info = {
 	.num_cat = ARRAY_SIZE(log_categories),
 };
 
+struct options {
+	long int ep_adj;
+	char *filename;
+};
+
+static void
+opts_help(void)
+{
+	fprintf(stderr, " -a ep       Adjust timestamp for endpoint (0x81, 0x82) by 1ms\n");
+	fprintf(stderr, " -i FILE     Input filename\n");
+	fprintf(stderr, " -h          help\n");
+}
+
+static int
+opts_parse(struct options *opts, int argc, char *argv[])
+{
+	const char *opts_short = "a:o:h";
+	int opt;
+
+	while ((opt = getopt(argc, argv, opts_short)) != -1) {
+		switch(opt) {
+		case 'a':
+			opts->ep_adj = strtol(optarg, NULL, 0);
+			break;
+
+		case 'o':
+			opts->filename = optarg;
+			break;
+
+		case 'h':
+		default:
+			opts_help();
+			exit(1);
+		}
+	}
+
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	char *fname;
 	int rc;
 	int i;
+	struct options opts = {
+		.ep_adj = -1,
+		.filename = NULL
+	};
+
+	opts_parse(&opts, argc, argv);
 
 	osmo_init_logging2(NULL, &log_info);
 	osmo_e1f_init();
 
-	if (argc < 2) {
+	if (!opts.filename)
+	{
 		fprintf(stderr, "You must specify the file name of the ICE40-E1 capture\n");
 		exit(1);
 	}
-	fname = argv[1];
 
-	rc = open_file(fname);
-	if (rc < 0) {
+	rc = open_file(opts.filename);
+	if (rc < 0)
+	{
 		fprintf(stderr, "Error opening %s: %s\n", fname, strerror(errno));
 		exit(1);
 	}
@@ -303,5 +417,5 @@ int main(int argc, char **argv)
 		ls->errplot.outfile = fopen(namebuf, "w");
 	}
 
-	process_file(rc);
+	process_file(rc, opts.ep_adj);
 }
