@@ -22,7 +22,7 @@
 static int g_do_exit = 0;
 
 #define USB_VID		0x1d50
-#define USB_PID		0x6145
+#define USB_PID		0x6151
 #define EP_DATA_IN0	0x81
 #define EP_DATA_IN1	0x82
 
