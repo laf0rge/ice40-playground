@@ -57,7 +57,6 @@ SOURCES_app=\
 	misc.c \
 	usb_dfu_rt.c \
 	usb_e1.c \
-	usb_dfu_rt.c \
 	usb_desc_app.c
 
 
