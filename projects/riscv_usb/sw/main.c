@@ -146,7 +146,6 @@ static void LIBUSB_CALL cb_xfr(struct libusb_transfer *xfr)
 			if (!(xfr->iso_packet_desc[j].status == LIBUSB_TRANSFER_COMPLETED)) {
 				fprintf(stderr, "[!] ISO packet status != completed (%d)\n",
 					xfr->iso_packet_desc[j].status);
-				g_do_exit = 1;
 			}
 
 			len += (xfr->iso_packet_desc[j].length = flow->size);
